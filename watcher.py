@@ -34,7 +34,7 @@ SENDER_APP_PASSWORD    = os.getenv("SENDER_APP_PASSWORD", "")
 RECIPIENT_EMAILS       = [e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()]
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 
-BMS_URL       = "https://in.bookmyshow.com/cinemas/ahmedabad/pvr-palladium-mall-ahmedabad/buytickets/PPAM/20260729"
+BMS_URL       = "https://in.bookmyshow.com/cinemas/ahmedabad/pvr-palladium-mall-ahmedabad/buytickets/PPAM/20260801"
 TARGET_MOVIE  = "odyssey"   # case-insensitive substring match
 TARGET_FORMAT = "imax"      # must also appear near the movie name
 
@@ -148,29 +148,116 @@ def _parse_html_dom(html: str) -> list[str]:
 
 # ─── Scraping methods ─────────────────────────────────────────────────────────
 
+# Shared browser-like headers for plain HTTP requests
+_REQ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/138.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+}
+
+
+def _get_nextjs_build_id() -> str | None:
+    """
+    Fetch the BMS homepage and extract the Next.js buildId from __NEXT_DATA__.
+    The homepage is far less likely to be blocked than the cinema page.
+    """
+    import requests
+    try:
+        resp = requests.get(
+            "https://in.bookmyshow.com/",
+            headers={**_REQ_HEADERS, "Accept": "text/html,*/*"},
+            timeout=20,
+        )
+        data = _parse_next_data(resp.text)
+        # We parsed the JSON — now pull buildId straight from the raw tag
+        from bs4 import BeautifulSoup
+        tag = BeautifulSoup(resp.text, "html.parser").find("script", id="__NEXT_DATA__")
+        if tag and tag.string:
+            build_id = json.loads(tag.string).get("buildId")
+            if build_id:
+                log.info(f"Got Next.js buildId: {build_id}")
+                return build_id
+    except Exception as e:
+        log.info(f"buildId fetch failed: {e}")
+    return None
+
+
+def check_with_nextjs_api() -> list[str] | None:
+    """
+    BMS is a Next.js app. Every page's server-side data is also available as a
+    JSON blob at:  /_next/data/{buildId}/{page path}.json
+
+    This endpoint is NOT protected the same way as the HTML page, so it often
+    works from datacenter IPs (GitHub Actions) when the HTML page returns 403.
+
+    Returns None  → couldn't reach the endpoint (try next method).
+    Returns []    → endpoint OK but Odyssey IMAX not listed yet.
+    Returns [..] → found show times.
+    """
+    import requests
+
+    build_id = _get_nextjs_build_id()
+    if not build_id:
+        log.info("Next.js API: could not get buildId — skipping.")
+        return None
+
+    # Construct the _next/data URL for the cinema page
+    page_path = (
+        "cinemas/ahmedabad/pvr-palladium-mall-ahmedabad"
+        f"/buytickets/PPAM/20260801"
+    )
+    json_url = f"https://in.bookmyshow.com/_next/data/{build_id}/{page_path}.json"
+    log.info(f"Trying Next.js JSON API: {json_url}")
+
+    try:
+        resp = requests.get(
+            json_url,
+            headers={
+                **_REQ_HEADERS,
+                "Accept": "application/json, */*",
+                "Referer": BMS_URL,
+                "x-nextjs-data": "1",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        raw = json.dumps(payload)
+        log.info(f"Next.js API responded ({len(raw)} chars).")
+
+        if TARGET_MOVIE not in raw.lower() or TARGET_FORMAT not in raw.lower():
+            log.info("Next.js API: Odyssey/IMAX not in response — not listed yet.")
+            return []
+
+        times = _extract_times_from_text(raw)
+        log.info(f"Next.js API: extracted {len(times)} show times.")
+        return times
+
+    except Exception as e:
+        log.info(f"Next.js API failed: {e}")
+        return None
+
+
 def check_with_requests() -> list[str] | None:
     """
-    Fast path: plain HTTP GET.
+    Fast path: plain HTTP GET of the cinema HTML page.
     Returns None  → page needs JS rendering (fallback to Playwright).
     Returns []    → rendered but Odyssey IMAX not found.
     Returns [..] → found.
     """
     import requests
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/138.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": "https://in.bookmyshow.com/",
-        "Cache-Control": "no-cache",
-    }
-
-    resp = requests.get(BMS_URL, headers=headers, timeout=30)
+    resp = requests.get(
+        BMS_URL,
+        headers={**_REQ_HEADERS, "Referer": "https://in.bookmyshow.com/"},
+        timeout=30,
+    )
     resp.raise_for_status()
 
     # Try __NEXT_DATA__ first — present even in SSR responses
@@ -343,35 +430,54 @@ def _dedup(times: list[str]) -> list[str]:
 
 def check_tickets() -> tuple[bool, list[str]]:
     """
-    Try the fast path first, fall back to Playwright.
+    Multi-method check. Tries faster/lighter methods first, escalates to Playwright.
+      1. Next.js JSON API  — no browser, works from datacenter IPs
+      2. Plain HTTP GET    — fast, works when BMS SSRs the page
+      3. Playwright        — full headless browser, last resort
     Returns (found: bool, show_times: list[str]).
     """
     log.info("🔍 Checking BMS for The Odyssey (IMAX) on Aug 1…")
 
-    show_times: list[str] = []
+    # ── Method 1: Next.js /_next/data JSON API ────────────────────────────
+    try:
+        result = check_with_nextjs_api()
+        if result is not None:
+            if result:
+                log.info(f"✅ ODYSSEY IMAX FOUND via Next.js API! Times: {result}")
+                return True, result
+            else:
+                log.info("❌ Odyssey IMAX not yet listed (Next.js API).")
+                return False, []
+    except Exception as e:
+        log.info(f"Next.js API exception: {e}")
 
-    # 1. Fast path (requests)
+    # ── Method 2: Plain HTTP GET of cinema HTML page ──────────────────────
     try:
         result = check_with_requests()
         if result is not None:
-            show_times = result
-        else:
-            raise RuntimeError("Page not rendered — need Playwright")
+            if result:
+                log.info(f"✅ ODYSSEY IMAX FOUND via requests! Times: {result}")
+                return True, result
+            elif result == []:
+                log.info("❌ Odyssey IMAX not yet listed (requests).")
+                return False, []
     except Exception as e:
         log.info(f"requests path: {e}")
-        # 2. Playwright path
-        try:
-            show_times = check_with_playwright()
-        except Exception as pw_err:
-            log.error(f"Playwright failed: {pw_err}")
-            return False, []
+
+    # ── Method 3: Full Playwright browser ────────────────────────────────
+    log.info("Escalating to Playwright (full headless browser)…")
+    try:
+        show_times = check_with_playwright()
+    except Exception as pw_err:
+        log.error(f"Playwright failed: {pw_err}")
+        return False, []
 
     if show_times:
-        log.info(f"✅ ODYSSEY IMAX FOUND! Show times: {show_times}")
+        log.info(f"✅ ODYSSEY IMAX FOUND via Playwright! Times: {show_times}")
         return True, show_times
-    else:
-        log.info("❌ Odyssey IMAX not yet listed.")
-        return False, []
+
+    log.info("❌ Odyssey IMAX not yet listed.")
+    return False, []
 
 
 # ─── Email ────────────────────────────────────────────────────────────────────
