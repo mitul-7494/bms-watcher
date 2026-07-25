@@ -13,6 +13,7 @@ Usage:
 import os
 import re
 import sys
+import io
 import json
 import time
 import smtplib
@@ -20,6 +21,14 @@ import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
+
+# ─── Force UTF-8 on Windows console (fixes emoji UnicodeEncodeError) ──────────
+# Python's default Windows console uses cp1252 which can't encode emojis.
+# Reconfigure stdout/stderr to utf-8 with 'replace' so it NEVER crashes.
+if sys.platform == 'win32' and hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.platform == 'win32' and hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Load .env file if it exists (for local runs)
 try:
@@ -39,15 +48,16 @@ TARGET_MOVIE  = "odyssey"   # case-insensitive substring match
 TARGET_FORMAT = "imax"      # must also appear near the movie name
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler("watcher.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+LOG_DATE   = "%Y-%m-%d %H:%M:%S"
+
+_file_handler   = logging.FileHandler("watcher.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE))
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE))
+
+logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 log = logging.getLogger(__name__)
 
 
