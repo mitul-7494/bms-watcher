@@ -64,15 +64,26 @@ log = logging.getLogger(__name__)
 # ─── Parsing helpers ──────────────────────────────────────────────────────────
 
 def _extract_times_from_text(text: str) -> list[str]:
-    """Pull HH:MM AM/PM tokens out of any text blob."""
-    raw = re.findall(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", text, re.IGNORECASE)
+    """
+    Pull HH:MM AM/PM tokens out of any text blob.
+    Only keeps plausible show-start times: minutes must be 00, 15, 30, or 45.
+    This filters out duration/counter noise like '11:59 AM' or '3:59 PM'.
+    """
+    raw = re.findall(r"\b(\d{1,2}):(\d{2})\s*(AM|PM)\b", text, re.IGNORECASE)
     seen: set[str] = set()
     result: list[str] = []
-    for t in raw:
-        key = t.upper().replace(" ", "")
+    for hour_s, minute_s, period in raw:
+        hour = int(hour_s)
+        minute = int(minute_s)
+        # Valid cinema show times: hour 1-12, minutes on quarter-hour
+        if hour < 1 or hour > 12:
+            continue
+        if minute not in (0, 15, 30, 45):
+            continue
+        key = f"{hour:02d}:{minute:02d}{period.upper()}"
         if key not in seen:
             seen.add(key)
-            result.append(t.upper())
+            result.append(f"{hour:02d}:{minute:02d} {period.upper()}")
     return result
 
 
@@ -299,11 +310,15 @@ def check_with_playwright() -> list[str]:
 
     # ── Stealth import (optional — graceful degradation if not installed) ──
     try:
-        from playwright_stealth import stealth_sync
+        from playwright_stealth import Stealth
         _stealth_available = True
     except ImportError:
-        _stealth_available = False
-        log.info("playwright-stealth not installed — running without it.")
+        try:
+            from playwright_stealth import stealth_sync as _stealth_sync_fn
+            _stealth_available = "legacy"
+        except ImportError:
+            _stealth_available = False
+            log.info("playwright-stealth not installed — running without it.")
 
     intercepted_times: list[str] = []
 
@@ -373,8 +388,11 @@ def check_with_playwright() -> list[str]:
         page = ctx.new_page()
 
         # Apply stealth patches before any navigation
-        if _stealth_available:
-            stealth_sync(page)
+        if _stealth_available == "legacy":
+            _stealth_sync_fn(page)
+            log.info("Stealth mode active (legacy API).")
+        elif _stealth_available:
+            Stealth().use_sync(page)
             log.info("Stealth mode active.")
 
         # Hook into network responses BEFORE navigating
