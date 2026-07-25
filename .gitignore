@@ -1,0 +1,14 @@
+# Secrets — NEVER commit these
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+watcher.log
+
+# Playwright cache
+playwright/

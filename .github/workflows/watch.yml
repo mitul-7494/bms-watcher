@@ -1,0 +1,75 @@
+name: 🎬 BMS Odyssey IMAX Watcher
+
+on:
+  # ── Scheduled checks ──────────────────────────────────────────────────────
+  # Runs every 30 minutes from now until Aug 2 (UTC times; IST = UTC+5:30).
+  # GitHub cron uses UTC. Aug 1 IST starts at Jul 31 18:30 UTC.
+  # We run from Jul 25 until Aug 1 23:59 IST (Aug 1 18:29 UTC).
+  schedule:
+    - cron: '*/30 * * 7 *'   # Every 30 min throughout July
+    - cron: '*/30 * 1 8 *'   # Every 30 min on Aug 1 UTC (covers Aug 1 IST morning)
+
+  # ── Manual trigger (run from phone/browser anytime) ───────────────────────
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you triggering this manually?'
+        required: false
+        default: 'Manual check'
+
+jobs:
+  watch:
+    name: Check for Odyssey IMAX tickets
+    runs-on: ubuntu-latest
+    # Don't fail the whole workflow if tickets aren't found yet (exit code 1)
+    # We only want a failure notification if something truly broke (exit code 2+)
+    continue-on-error: false
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ─────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install Python deps ──────────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Install Playwright + Chromium ────────────────────────────────────
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      # ── 5. Run the watcher (single check) ───────────────────────────────────
+      - name: Check BMS for Odyssey IMAX tickets
+        id: check
+        env:
+          SENDER_EMAIL:        ${{ secrets.SENDER_EMAIL }}
+          SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
+          RECIPIENT_EMAILS:    ${{ secrets.RECIPIENT_EMAILS }}
+        # Exit codes:
+        #   0 = tickets found + email sent  ✅
+        #   1 = not found yet               ⏳ (normal, not an error)
+        #   2 = tickets found but email failed ❌
+        run: |
+          python watcher.py --single-check
+          echo "EXIT_CODE=$?" >> $GITHUB_OUTPUT
+        continue-on-error: true   # Allow exit code 1 without marking the job red
+
+      # ── 6. Report outcome in the Actions log ────────────────────────────────
+      - name: Report outcome
+        run: |
+          CODE="${{ steps.check.outputs.EXIT_CODE }}"
+          if [ "$CODE" = "0" ]; then
+            echo "🎉 TICKETS FOUND! Email sent to all recipients."
+          elif [ "$CODE" = "1" ]; then
+            echo "⏳ Odyssey IMAX not listed yet. Will check again in 30 min."
+          else
+            echo "❌ Tickets found but email send failed (exit $CODE). Check secrets."
+            exit 1
+          fi
