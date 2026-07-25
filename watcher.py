@@ -34,7 +34,7 @@ SENDER_APP_PASSWORD    = os.getenv("SENDER_APP_PASSWORD", "")
 RECIPIENT_EMAILS       = [e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").split(",") if e.strip()]
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 
-BMS_URL       = "https://in.bookmyshow.com/cinemas/ahmedabad/pvr-palladium-mall-ahmedabad/buytickets/PPAM/20260801"
+BMS_URL       = "https://in.bookmyshow.com/cinemas/ahmedabad/pvr-palladium-mall-ahmedabad/buytickets/PPAM/20260729"
 TARGET_MOVIE  = "odyssey"   # case-insensitive substring match
 TARGET_FORMAT = "imax"      # must also appear near the movie name
 
