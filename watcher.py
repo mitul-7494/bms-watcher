@@ -20,6 +20,14 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime
 
+# Reconfigure stdout/stderr to support UTF-8 emojis on Windows console
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # Load .env file if it exists (for local runs)
 try:
     from dotenv import load_dotenv
@@ -34,8 +42,8 @@ RECIPIENT_EMAILS      = [e.strip() for e in os.getenv("RECIPIENT_EMAILS", "").sp
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 
 BMS_URL        = "https://in.bookmyshow.com/cinemas/ahmedabad/pvr-palladium-mall-ahmedabad/buytickets/PPAM/20260729"
-TARGET_MOVIE   = "odyssey"   # case-insensitive substring match
-TARGET_FORMAT  = "imax"      # must also appear near the movie name
+TARGET_MOVIE   = "the-odyssey"       # lowercase substring matching in href
+TARGET_FORMAT  = "imax"              # must also appear in href, movie name, or ancestor format info
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -55,39 +63,36 @@ log = logging.getLogger(__name__)
 def _parse_shows(html: str) -> list[str]:
     """
     Parse the rendered HTML and return a list of show-time strings for
-    any 'Odyssey' + 'IMAX' combination.  Returns an empty list if not found.
+    any 'the-odyssey' + 'IMAX' combination.  Returns an empty list if not found.
     """
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
-
-    # Quick gate: both keywords must appear somewhere on the page
-    if TARGET_MOVIE not in page_text.lower() or TARGET_FORMAT not in page_text.lower():
-        return []
-
     show_times: list[str] = []
 
-    # BMS renders each movie as a row / card; walk up from every element that
-    # contains "odyssey" and look for an IMAX sibling/ancestor section.
-    odyssey_nodes = soup.find_all(
-        string=lambda t: t and TARGET_MOVIE in t.lower()
-    )
+    # Find all <a> tags whose href contains 'the-odyssey'
+    odyssey_links = soup.find_all("a", href=lambda h: h and TARGET_MOVIE in h.lower())
 
-    for node in odyssey_nodes:
-        # Walk up the DOM tree to find a block that also contains "IMAX"
-        ancestor = node.find_parent()
-        for _ in range(12):
-            if ancestor is None:
+    for link in odyssey_links:
+        href = link.get("href", "").lower()
+        link_text = link.get_text(" ", strip=True).lower()
+
+        # Walk up to the container of the movie card (usually depth 2 or 3)
+        ancestor = link
+        for _ in range(3):
+            if ancestor.parent:
+                ancestor = ancestor.parent
+            else:
                 break
-            ancestor_text = ancestor.get_text(" ", strip=True)
-            if TARGET_FORMAT in ancestor_text.lower():
-                # Extract all HH:MM AM/PM tokens from this block
-                times = re.findall(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", ancestor_text, re.IGNORECASE)
-                if times:
-                    show_times.extend(t.upper() for t in times)
-                break
-            ancestor = ancestor.find_parent()
+
+        ancestor_text = ancestor.get_text(" ", strip=True)
+
+        # Check if target format (e.g. "imax") is in href, link text, or ancestor text
+        if TARGET_FORMAT in href or TARGET_FORMAT in link_text or TARGET_FORMAT in ancestor_text.lower():
+            # Extract show times
+            times = re.findall(r"\b\d{1,2}:\d{2}\s*(?:AM|PM)\b", ancestor_text, re.IGNORECASE)
+            if times:
+                show_times.extend(t.upper() for t in times)
 
     # Deduplicate while preserving order
     seen: set[str] = set()
@@ -164,18 +169,16 @@ def check_with_playwright() -> list[str]:
         page = ctx.new_page()
 
         log.info(f"Navigating to: {BMS_URL}")
-        page.goto(BMS_URL, wait_until="networkidle", timeout=90_000)
+        # Wait for "load" instead of "networkidle" to avoid timeout due to analytics network requests
+        page.goto(BMS_URL, wait_until="load", timeout=45_000)
 
-        # Try to wait for movie listing elements
+        # Try to wait for the movie link first, then other selectors
         selectors = [
-            "[class*='show-details']",
-            "[class*='__movie-name']",
-            "[class*='movie-name']",
-            "[class*='showtime']",
+            f"a[href*='{TARGET_MOVIE}']"
         ]
         for sel in selectors:
             try:
-                page.wait_for_selector(sel, timeout=8_000)
+                page.wait_for_selector(sel, timeout=10_000)
                 log.info(f"Playwright: found selector '{sel}'")
                 break
             except Exception:
